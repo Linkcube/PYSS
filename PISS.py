@@ -8,13 +8,14 @@ import requests
 from mutagen.id3 import ID3, TIT2, TPE1, COMM, APIC
 from mutagen.easyid3 import EasyID3
 from pyquery import PyQuery
+import threading
 
 BLOCK_SIZE = 1024 # bytes
-FILE_CHECK_INTERVAL = 1  # seconds
+FILE_CHECK_INTERVAL = 1.0  # seconds
 FILE_PATH = ""
 INVALID_CHARACTERS = "<>:\"/\\|?*"
 EXTENSION = "mp3"
-TIMEOUT = 0
+TIMEOUT = 0.0
 VALID_ARGS = ["-load", "-save", "-timeout", "-file_path", "-block_size", "-file_check_interval", "-dj_url",
               "-dj_element", "-stream", "-stream_file", "-exclude_dj", "-np_element", "-cue_only"]
 CONFIG_FILE = "config.json"
@@ -28,6 +29,7 @@ ICECAST_STATUS_LOCATION = "status-json.xsl"
 EXCLUDE_DJ = []
 DJ_ART = "dj_art"
 CUE_ONLY = False
+STREAM_LAG = 0.0
 
 
 class StreamData:
@@ -92,11 +94,16 @@ def safe_stdout(to_print):
     Print on any ascii terminal without crashing.
     """
     try:
-        sys.stdout.write(to_print)
+        sys.stdout.write(to_print[:79])
     # TODO change to accurate exception
     except:
-        sys.stdout.write(to_print.encode('ascii', errors='ignore').decode())
+        sys.stdout.write(to_print.encode('ascii', errors='ignore').decode()[:79])
     sys.stdout.flush()
+
+
+def format_seconds(seconds):
+    m, s = divmod(seconds, 60)
+    return "%02d:%02d" % (m, s)
 
 
 def begin_recording(stream_data, file_name, request, write_method, end_on_finish=False):
@@ -105,21 +112,28 @@ def begin_recording(stream_data, file_name, request, write_method, end_on_finish
     """
     #TODO: check whether you can retrieve metadata from the stream file to reduce desync
     last_check = time.time()
-    safe_stdout("\rRecording: %s.mp3" % stream_data.title)
+    start_time = time.time()
+    base_print = "\rRecording: %s.mp3" % stream_data.title
+    safe_stdout(base_print)
+    sleepy_end = False
     with open(file_name, write_method) as f:
         try:
             for block in request.iter_content():
                 f.write(block)
-                if time.time() - last_check > FILE_CHECK_INTERVAL:
+                if not sleepy_end and time.time() - last_check > FILE_CHECK_INTERVAL:
+                    # safe_stdout("\r%s %s    " % (base_print, format_seconds(time.time() - start_time)))
                     old_title = stream_data.title
                     stream_data.update()
                     if old_title != stream_data.title:
-                        if end_on_finish:
-                            return False, False
-                        else:
-                            return True, False
+                        sleepy_end = True
+                        last_check = time.time()
                     else:
                         last_check = time.time()
+                if sleepy_end and time.time() - last_check > STREAM_LAG:
+                    if end_on_finish:
+                        return False, False
+                    else:
+                        return True, False
                 # if queue.get() is True:
                 #    return True
         except KeyboardInterrupt:
@@ -347,6 +361,7 @@ def recording_loop(request, stream_data, stream_url):
                 time.sleep(FILE_CHECK_INTERVAL)
                 continue
             if dj_name != new_dj_name:
+                safe_stdout("\n")
                 dj_name = new_dj_name
                 folder_name = "%s %s" % (int(time.time()), dj_name)
                 os.mkdir(os.path.join(FILE_PATH, folder_name))
@@ -368,7 +383,7 @@ def recording_loop(request, stream_data, stream_url):
             artist, title = old_title.split(" - ")
         except ValueError:
             artist = title = ""
-            safe_stdout(WHITE_SPACE)
+            # safe_stdout(WHITE_SPACE)
             print "failed to get artist - title from %s" % old_title
         tag_file(title, artist, track_number, file_name, folder_name, dj_name, dj_image_extension)
         track_number += 1
@@ -420,8 +435,12 @@ def setup():
     stream_url, stream_xsl = verify_config(config_data)
     optional_config(config_data)
     request = requests.get(stream_url, stream=True)
+    a = time.time()
     stream_data = StreamData(stream_xsl)
     stream_data.update()
+    d = time.time()
+    global STREAM_LAG
+    STREAM_LAG = d - a
     return request, stream_data, stream_url
 
 
