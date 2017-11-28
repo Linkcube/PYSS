@@ -3,20 +3,20 @@
 # Python Icecast Stream Saver
 # only for mp3 at the moment
 import time, os, sys, re, json, imghdr
-from multiprocessing import Process, Queue
 import requests
+from requests.exceptions import ConnectionError
 from mutagen.id3 import ID3, TIT2, TPE1, COMM, APIC
 from mutagen.easyid3 import EasyID3
 from pyquery import PyQuery
 import threading
 
 BLOCK_SIZE = 1024 # bytes
-FILE_CHECK_INTERVAL = 1.0  # seconds
+DJ_CHECK_INTERVAL = 60.0  # seconds
 FILE_PATH = ""
 INVALID_CHARACTERS = "<>:\"/\\|?*"
 EXTENSION = "mp3"
-TIMEOUT = 0.0
-VALID_ARGS = ["-load", "-save", "-timeout", "-file_path", "-block_size", "-file_check_interval", "-dj_url",
+TIMEOUT = 60.0
+VALID_ARGS = ["-load", "-save", "-timeout", "-file_path", "-block_size", "-dj_check_interval", "-dj_url",
               "-dj_element", "-stream", "-stream_file", "-exclude_dj", "-np_element", "-cue_only"]
 CONFIG_FILE = "config.json"
 DJ_URL = ""
@@ -30,6 +30,7 @@ EXCLUDE_DJ = []
 DJ_ART = "dj_art"
 CUE_ONLY = False
 STREAM_LAG = 0.0
+SONG_CHECK_INTERVAL = .5
 
 
 class StreamData:
@@ -53,16 +54,15 @@ class StreamData:
             try:
                 self._update()
                 done = True
-            except KeyboardInterrupt:
-                print "\nKeyboard interrupt detected, quitting"
-                quit()
             # TODO change to accurate exception
-            except:
+            except Exception as e:
+                if type(e) == KeyboardInterrupt:
+                    raise KeyboardInterrupt
                 if 0 < TIMEOUT < time.time() - start:
                     print "Update stream exceeded timeout limit, exiting program"
                     time.sleep(1)
                 safe_stdout("\rError in updating stream, waiting..\n")
-                time.sleep(FILE_CHECK_INTERVAL)
+                time.sleep(SONG_CHECK_INTERVAL)
 
     def _update(self):
         xsl = requests.get(self.xsl_url)
@@ -106,63 +106,102 @@ def format_seconds(seconds):
     return "%02d:%02d" % (m, s)
 
 
+def clock_printer(base_print, lock):
+    start_time = time.time()
+    while not lock.acquire(blocking=0):
+        safe_stdout("\r%s %s" % (base_print, format_seconds(time.time() - start_time)))
+        time.sleep(1)
+
+
+def record_stream(filename, write_method, request, lock, panic):
+    panic.acquire()
+    with open(filename, write_method) as f:
+        try:
+            for block in request.iter_content():
+                f.write(block)
+                if lock.acquire(blocking=0):
+                    f.close()
+                    return
+        except requests.exceptions.ChunkedEncodingError:
+            # Stream issue, should go into an append reccording
+            panic.release()
+            f.close()
+            return
+
+
 def begin_recording(stream_data, file_name, request, write_method, end_on_finish=False):
     """
     Returns first whether to continue recording, and secondly if the recording is incomplete.
     """
     #TODO: check whether you can retrieve metadata from the stream file to reduce desync
     last_check = time.time()
-    start_time = time.time()
     base_print = "\rRecording: %s.mp3" % stream_data.title
-    safe_stdout(base_print)
+    printer_lock = threading.RLock()
+    printer_lock.acquire()
+    writer_lock = threading.RLock()
+    writer_lock.acquire()
+    printer = threading.Thread(target=clock_printer, args=(base_print, printer_lock))
+    printer.daemon = True
+    printer.start()
+    panic_lock = threading.RLock()
+    writer = threading.Thread(target=record_stream, args=(file_name, write_method, request, writer_lock, panic_lock))
+    writer.daemon = True
+    writer.start()
     sleepy_end = False
-    with open(file_name, write_method) as f:
-        try:
-            for block in request.iter_content():
-                f.write(block)
-                if not sleepy_end and time.time() - last_check > FILE_CHECK_INTERVAL:
-                    # safe_stdout("\r%s %s    " % (base_print, format_seconds(time.time() - start_time)))
-                    old_title = stream_data.title
-                    stream_data.update()
-                    if old_title != stream_data.title:
-                        sleepy_end = True
-                        last_check = time.time()
-                    else:
-                        last_check = time.time()
-                if sleepy_end and time.time() - last_check > STREAM_LAG:
-                    if end_on_finish:
-                        return False, False
-                    else:
-                        return True, False
-                # if queue.get() is True:
-                #    return True
-        except KeyboardInterrupt:
-            return False, True
-            # exit_param = False
-        except requests.exceptions.ChunkedEncodingError:
-            # Stream issue, should go into an append reccording
-            return True, True
-            # exit_param = False
-    # return begin_recording(stream_data, file_name, request, "ab", exit_param)
 
-        # except AttributeError:
-            # return True
+    try:
+        while not panic_lock.acquire(blocking=0):
+            if not sleepy_end and time.time() - last_check > SONG_CHECK_INTERVAL:
+                old_title = stream_data.title
+                stream_data.update()
+                if old_title != stream_data.title:
+                    sleepy_end = True
+                    last_check = time.time()
+                else:
+                    last_check = time.time()
+            if sleepy_end and time.time() - last_check > STREAM_LAG:
+                printer_lock.release()
+                writer_lock.release()
+                if end_on_finish:
+                    return False, False
+                else:
+                    return True, False
+    except KeyboardInterrupt:
+        printer_lock.release()
+        writer_lock.release()
+        return False, True
+    printer_lock.release()
+    writer_lock.release()
+    return True, True
+
+
+def safe_query(query):
+    start = time.time()
+    while True:
+        try:
+            return PyQuery(query)
+        except ConnectionError as e:
+            if 0 < TIMEOUT < time.time() - start:
+                safe_stdout("PyQuery timed out with the following message: %s" % e.message)
+                safe_stdout("Quitting the program now..")
+                quit()
+            time.sleep(1.0)
 
 
 def get_dj():
-    query = PyQuery(DJ_URL)
+    query = safe_query(DJ_URL)
     tag = query(DJ_ELEMENT)
     return tag.text()
 
 
 def get_dj_art():
-    query = PyQuery(DJ_URL)
+    query = safe_query(DJ_URL)
     img_src = query(DJ_IMG_ELEMENT).attr('src')
     return DJ_URL + img_src
 
 
 def backup_get_title():
-    query = PyQuery(DJ_URL)
+    query = safe_query(DJ_URL)
     tag = query(NP_ELEMENT)
     return tag.text()
 
@@ -202,8 +241,8 @@ def load_args():
             elif arg == "-block_size":
                 config_data['block_size'] = int(sys.argv[i + 1])
                 i += 1
-            elif arg == "-file_check_interval":
-                config_data['file_check_interval'] = int(sys.argv[i + 1])
+            elif arg == "-dj_check_interval":
+                config_data['dj_check_interval'] = int(sys.argv[i + 1])
                 i += 1
             elif arg == "-dj_url":
                 config_data['dj_url'] = sys.argv[i + 1]
@@ -287,7 +326,7 @@ def optional_config(config):
     timeout = config.get("timeout")
     file_path = config.get("file_path")
     block_size = config.get("block_size")
-    file_check_interval = config.get("file_check_interval")
+    dj_check_interval = config.get("dj_check_interval")
     dj_img_element = config.get("dj_img_element")
     exclude_dj = config.get("exclude_dj")
     np_element = config.get("np_element")
@@ -310,9 +349,9 @@ def optional_config(config):
     if block_size:
         global BLOCK_SIZE
         BLOCK_SIZE = block_size
-    if file_check_interval:
-        global FILE_CHECK_INTERVAL
-        FILE_CHECK_INTERVAL = file_check_interval
+    if dj_check_interval:
+        global DJ_CHECK_INTERVAL
+        DJ_CHECK_INTERVAL = DJ_CHECK_INTERVAL
     if dj_img_element:
         global DJ_IMG_ELEMENT
         DJ_IMG_ELEMENT = dj_img_element
@@ -344,6 +383,21 @@ def tag_file(title, artist, track_number, file_name, folder_name, dj_name, image
     tags.save()
 
 
+def wait_on_file_rename(file_name, new_name):
+    done = False
+    start = time.time()
+    while not done:
+        try:
+            os.rename(file_name, new_name)
+            done = True
+        except WindowsError as e:
+            time.sleep(.01)
+            if 0 < TIMEOUT < time.time() - start:
+                safe_stdout("TIMEOUT waiting for file access, quitting.")
+                safe_stdout(e.message)
+                quit()
+
+
 def recording_loop(request, stream_data, stream_url):
     dj_name = ""
     first_run = True
@@ -358,9 +412,10 @@ def recording_loop(request, stream_data, stream_url):
             new_dj_name = get_dj()
             if new_dj_name in EXCLUDE_DJ:
                 safe_stdout("\rExcluded DJ detected, skipping %s" % new_dj_name)
-                time.sleep(FILE_CHECK_INTERVAL)
+                time.sleep(DJ_CHECK_INTERVAL)
                 continue
             if dj_name != new_dj_name:
+                track_number = 1
                 safe_stdout("\n")
                 dj_name = new_dj_name
                 folder_name = "%s %s" % (int(time.time()), dj_name)
@@ -372,8 +427,8 @@ def recording_loop(request, stream_data, stream_url):
                     for chunk in response:
                         image.write(chunk)
                         dj_image_extension = imghdr.what(os.path.join(folder_name, DJ_ART))
-                os.rename(os.path.join(folder_name, DJ_ART),
-                          os.path.join(folder_name, "%s.%s" % (DJ_ART, dj_image_extension)))
+                wait_on_file_rename(os.path.join(folder_name, DJ_ART),
+                                    os.path.join(folder_name, "%s.%s" % (DJ_ART, dj_image_extension)))
         file_name = make_file_name(stream_data.title, folder_name, False)
         if os.path.isfile(file_name):
             file_name = make_file_name("%s_1" % stream_data.title, folder_name, False)
@@ -384,13 +439,13 @@ def recording_loop(request, stream_data, stream_url):
         except ValueError:
             artist = title = ""
             # safe_stdout(WHITE_SPACE)
-            print "failed to get artist - title from %s" % old_title
+            safe_stdout("\nfailed to get artist - title from %s\n" % old_title)
         tag_file(title, artist, track_number, file_name, folder_name, dj_name, dj_image_extension)
         track_number += 1
         safe_stdout(WHITE_SPACE)
         if incomplete or not continue_recording or first_run:
             new_file_name = make_file_name(old_title, folder_name, True)
-            os.rename(file_name, new_file_name)
+            wait_on_file_rename(file_name, new_file_name)
             safe_stdout("\rPartially Recorded: %s.%s\n" % (old_title, EXTENSION))
             first_run = False
         else:
@@ -439,8 +494,9 @@ def setup():
     stream_data = StreamData(stream_xsl)
     stream_data.update()
     d = time.time()
-    global STREAM_LAG
-    STREAM_LAG = d - a
+    # disabling stream lag till a proper test can be run to confirm the results actually help
+    # global STREAM_LAG
+    # STREAM_LAG = d - a
     return request, stream_data, stream_url
 
 
