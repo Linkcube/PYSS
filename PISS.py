@@ -9,6 +9,7 @@ from mutagen.id3 import ID3, TIT2, TPE1, COMM, APIC
 from mutagen.easyid3 import EasyID3
 from pyquery import PyQuery
 import threading
+import logging
 
 BLOCK_SIZE = 1024 # bytes
 DJ_CHECK_INTERVAL = 60.0  # seconds
@@ -31,6 +32,9 @@ DJ_ART = "dj_art"
 CUE_ONLY = False
 STREAM_LAG = 0.0
 SONG_CHECK_INTERVAL = .5
+FORMAT = "%s %(message)s" % time.time()
+logging.basicConfig(format=FORMAT)
+LOGGER = logging.getLogger()
 
 
 class StreamData:
@@ -59,9 +63,10 @@ class StreamData:
                 if type(e) == KeyboardInterrupt:
                     raise KeyboardInterrupt
                 if 0 < TIMEOUT < time.time() - start:
-                    print "Update stream exceeded timeout limit, exiting program"
+                    safe_stdout("\nUpdate stream exceeded timeout limit, exiting program")
                     time.sleep(1)
                 safe_stdout("\rError in updating stream, waiting..\n")
+                LOGGER.warning("Stream update error: %s" % e.message)
                 time.sleep(SONG_CHECK_INTERVAL)
 
     def _update(self):
@@ -93,6 +98,7 @@ def safe_stdout(to_print):
     """
     Print on any ascii terminal without crashing.
     """
+    LOGGER.info(to_print)
     try:
         sys.stdout.write(to_print[:79])
     # TODO change to accurate exception
@@ -135,7 +141,7 @@ def begin_recording(stream_data, file_name, request, write_method, end_on_finish
     """
     #TODO: check whether you can retrieve metadata from the stream file to reduce desync
     last_check = time.time()
-    base_print = "\rRecording: %s.mp3" % stream_data.title
+    base_print = "\rRecording: %s" % stream_data.title
     printer_lock = threading.RLock()
     printer_lock.acquire()
     writer_lock = threading.RLock()
@@ -183,7 +189,7 @@ def safe_query(query):
         except ConnectionError as e:
             if 0 < TIMEOUT < time.time() - start:
                 safe_stdout("PyQuery timed out with the following message: %s" % e.message)
-                safe_stdout("Quitting the program now..")
+                safe_stdout("\nQuitting the program now..")
                 quit()
             time.sleep(1.0)
 
@@ -393,7 +399,7 @@ def wait_on_file_rename(file_name, new_name):
         except WindowsError as e:
             time.sleep(.01)
             if 0 < TIMEOUT < time.time() - start:
-                safe_stdout("TIMEOUT waiting for file access, quitting.")
+                safe_stdout("\nTIMEOUT waiting for file access, quitting.")
                 safe_stdout(e.message)
                 quit()
 
@@ -416,11 +422,10 @@ def recording_loop(request, stream_data, stream_url):
                 continue
             if dj_name != new_dj_name:
                 track_number = 1
-                safe_stdout("\n")
                 dj_name = new_dj_name
                 folder_name = "%s %s" % (int(time.time()), dj_name)
                 os.mkdir(os.path.join(FILE_PATH, folder_name))
-                safe_stdout("Current DJ: %s\n" % dj_name)
+                safe_stdout("\nCurrent DJ: %s\n" % dj_name)
                 dj_image_url = get_dj_art()
                 response = requests.get(dj_image_url, stream=True)
                 with open(os.path.join(folder_name, DJ_ART), "wb") as image:
@@ -430,15 +435,16 @@ def recording_loop(request, stream_data, stream_url):
                 wait_on_file_rename(os.path.join(folder_name, DJ_ART),
                                     os.path.join(folder_name, "%s.%s" % (DJ_ART, dj_image_extension)))
         file_name = make_file_name(stream_data.title, folder_name, False)
-        if os.path.isfile(file_name):
-            file_name = make_file_name("%s_1" % stream_data.title, folder_name, False)
+        rename_attempt = 1
+        while os.path.isfile(file_name):
+            file_name = make_file_name("%s_%d" % (stream_data.title, rename_attempt), folder_name, False)
+            rename_attempt += 1
         old_title = stream_data.title
         continue_recording, incomplete = begin_recording(stream_data, file_name, request, "wb")
         try:
             artist, title = old_title.split(" - ")
         except ValueError:
             artist = title = ""
-            # safe_stdout(WHITE_SPACE)
             safe_stdout("\nfailed to get artist - title from %s\n" % old_title)
         tag_file(title, artist, track_number, file_name, folder_name, dj_name, dj_image_extension)
         track_number += 1
@@ -446,10 +452,10 @@ def recording_loop(request, stream_data, stream_url):
         if incomplete or not continue_recording or first_run:
             new_file_name = make_file_name(old_title, folder_name, True)
             wait_on_file_rename(file_name, new_file_name)
-            safe_stdout("\rPartially Recorded: %s.%s\n" % (old_title, EXTENSION))
+            safe_stdout("\rPartially Recorded: %s\n" % old_title)
             first_run = False
         else:
-            safe_stdout("\rRecorded: %s.%s\n" % (old_title, EXTENSION))
+            safe_stdout("\rRecorded: %s\n" % old_title)
         request = requests.get(stream_url, stream=True)
 
 
