@@ -1,22 +1,9 @@
-Stream Saver (tmp)
+Python Stream Saver
 
-The purpose of this script is to download internet radio streams to your computer, specifically to replace the stream_ripper program that is no longer updated.
+This is a simple internet radio downloader, currently not stable enough so there's probably better alternatives. This is mainly just to keep track of progress and whatnot.
 
 While this currently only supports Icecast 2.x streams in mp3, in future builds it should be able to support more standards such as Shoutcast, as well as change the
 audio extension to whatever the stream is using.
-
-Plans:
-	- Automatically switch file extensions
-	- Support more stream standards
-	- More cmd arg options
-		+ A no-stream option, only generate list of what was streamed
-		+ Don't split files
-		+ Order files through tagging
-		+ Improved tagging (DB lookup?)
-		+ GUI (?)
-		+ quit during recording loop elegantly
-		+ auto-fix errors (start again after errors rather than quit)
-		+ continue audio files rather than quit/overwrite
 
 CMD use:
 	-load config_name
