@@ -6,24 +6,50 @@ While this currently only supports Icecast 2.x streams in mp3, in future builds 
 audio extension to whatever the stream is using.
 
 CMD use:
-	-load config_name
-		+ loads a config of config_name from the config.json file
-		+ no default
-	-save config_name
-		+ saves the current config (after all args are parsed) to config.json under config_name
-		+ no default
-	-timeout n
-		+ sets the global timeout for any spinlocks to n seconds
-		+ defaults to 20
-	-file_path foo/bar
-		+ sets the file path to store files/folders, use / or C:\ to specify root otherwise it will assume local dir
-		+ defaults to the current dir
-	-file_check_interval
-		+ the interval in seconds at which the server is pinged for a change in song title
-		+ defaults to 1
-	-dj_url
-		+ the website url to scrape the DJs name from
-		+ defaults to none
-	-dj_element
-		+ the page element to scrape for the DJs name
-		+ defaults to none
++	load config_name
+		+[TOC]: # " "
+
+
+		 loads a config of config_name from the config.json file
+		 no default
++	save config_name
+		[TOC]: # " "
+
+
+		 saves the current config (after all args are parsed) to config.json under config_name
+		 no default
++	timeout n
+        [TOC]: # " "
+
+
+
+		 sets the global timeout for any spinlocks to n seconds
+		 defaults to 20
++	file_path foo/bar
+        [TOC]: # " "
+
+
+
+         sets the file path to store files/folders, use / or C:\ to specify root otherwise it will assume local dir
+		 defaults to the current dir
++	file_check_interval
+        [TOC]: # " "
+
+
+
+		 the interval in seconds at which the server is pinged for a change in song title
+		 defaults to 1
++	dj_url
+        [TOC]: # " "
+
+
+
+		 the website url to scrape the DJs name from
+		 defaults to none
++	dj_element
+        [TOC]: # " "
+
+
+
+		the page element to scrape for the DJs name
+		 defaults to none
