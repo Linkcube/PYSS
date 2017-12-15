@@ -9,16 +9,15 @@ from mutagen.id3 import ID3, TIT2, TPE1, COMM, APIC
 from mutagen.easyid3 import EasyID3
 from pyquery import PyQuery
 import threading
-import logging
 
 BLOCK_SIZE = 1024 # bytes
 DJ_CHECK_INTERVAL = 60.0  # seconds
 FILE_PATH = ""
 INVALID_CHARACTERS = "<>:\"/\\|?*"
 EXTENSION = "mp3"
-TIMEOUT = 60.0
+TIMEOUT = 0
 VALID_ARGS = ["-load", "-save", "-timeout", "-file_path", "-block_size", "-dj_check_interval", "-dj_url",
-              "-dj_element", "-stream", "-stream_file", "-exclude_dj", "-np_element", "-cue_only"]
+              "-dj_element", "-stream", "-stream_file", "-exclude_dj", "-np_element"]
 CONFIG_FILE = "config.json"
 DJ_URL = ""
 DJ_ELEMENT = ""
@@ -30,11 +29,11 @@ ICECAST_STATUS_LOCATION = "status-json.xsl"
 EXCLUDE_DJ = []
 DJ_ART = "dj_art"
 CUE_ONLY = False
-STREAM_LAG = 0.0
 SONG_CHECK_INTERVAL = .5
-FORMAT = "%s %(message)s" % time.time()
-logging.basicConfig(format=FORMAT)
-LOGGER = logging.getLogger()
+DJ_DICT = {}
+BITRATE_MOD = 1024 / 8
+STREAM_DELAY = 2  # seems to be the normal value
+CLI_LIMIT = 70
 
 
 class StreamData:
@@ -59,6 +58,7 @@ class StreamData:
                 self._update()
                 done = True
             # TODO change to accurate exception
+            # TODO change the title to represent that an error has occured (which will be fixed when updated)
             except Exception as e:
                 if type(e) == KeyboardInterrupt:
                     raise KeyboardInterrupt
@@ -66,7 +66,6 @@ class StreamData:
                     safe_stdout("\nUpdate stream exceeded timeout limit, exiting program")
                     time.sleep(1)
                 safe_stdout("\rError in updating stream, waiting..\n")
-                LOGGER.warning("Stream update error: %s" % e.message)
                 time.sleep(SONG_CHECK_INTERVAL)
 
     def _update(self):
@@ -98,12 +97,11 @@ def safe_stdout(to_print):
     """
     Print on any ascii terminal without crashing.
     """
-    LOGGER.info(to_print)
     try:
-        sys.stdout.write(to_print[:79])
+        sys.stdout.write(to_print[:CLI_LIMIT])
     # TODO change to accurate exception
     except:
-        sys.stdout.write(to_print.encode('ascii', errors='ignore').decode()[:79])
+        sys.stdout.write(to_print.decode('utf-8')[:CLI_LIMIT])
     sys.stdout.flush()
 
 
@@ -112,16 +110,9 @@ def format_seconds(seconds):
     return "%02d:%02d" % (m, s)
 
 
-def clock_printer(base_print, lock):
-    start_time = time.time()
-    while not lock.acquire(blocking=0):
-        safe_stdout("\r%s %s" % (base_print, format_seconds(time.time() - start_time)))
-        time.sleep(1)
-
-
-def record_stream(filename, write_method, request, lock, panic):
+def record_stream(location, request, lock, panic):
     panic.acquire()
-    with open(filename, write_method) as f:
+    with open(os.path.join(location, 'recording_bloc.%s' % EXTENSION), 'wb') as f:
         try:
             for block in request.iter_content():
                 f.write(block)
@@ -129,56 +120,100 @@ def record_stream(filename, write_method, request, lock, panic):
                     f.close()
                     return
         except requests.exceptions.ChunkedEncodingError:
-            # Stream issue, should go into an append reccording
+            # Stream issue, should go into an append recording
             panic.release()
             f.close()
             return
 
 
-def begin_recording(stream_data, file_name, request, write_method, end_on_finish=False):
+def swap_djs(location, name, dj_dict):
+    dj_image_url = get_dj_art()
+    response = requests.get(dj_image_url, stream=True)
+    with open(os.path.join(location, name), "wb") as image:
+        for chunk in response:
+            image.write(chunk)
+            dj_image_extension = imghdr.what(os.path.join(location, name))
+    wait_on_file_rename(os.path.join(location, name),
+                        os.path.join(location, "%s.%s" % (name, dj_image_extension)))
+    dj_dict[name] = dj_image_extension
+
+
+def begin_recording(stream_data, location, request, dj_dict):
     """
     Returns first whether to continue recording, and secondly if the recording is incomplete.
     """
-    #TODO: check whether you can retrieve metadata from the stream file to reduce desync
-    last_check = time.time()
+    # TODO change over to tracking bits during recording rather than just time
     base_print = "\rRecording: %s" % stream_data.title
-    printer_lock = threading.RLock()
-    printer_lock.acquire()
     writer_lock = threading.RLock()
     writer_lock.acquire()
-    printer = threading.Thread(target=clock_printer, args=(base_print, printer_lock))
-    printer.daemon = True
-    printer.start()
     panic_lock = threading.RLock()
-    writer = threading.Thread(target=record_stream, args=(file_name, write_method, request, writer_lock, panic_lock))
+    writer = threading.Thread(target=record_stream, args=(location, request, writer_lock, panic_lock))
     writer.daemon = True
     writer.start()
-    sleepy_end = False
+    current_title = stream_data.title
+    dj = ""
+    song_start = time.time()
+    start = True
+
+    cue_file = open(os.path.join(location, "cue_file.txt"), 'w')
+
+    if CHECK_FOR_DJ:
+        dj_found = False
+        while not dj_found:
+            new_dj = get_dj()
+            if new_dj != dj:
+                if new_dj in EXCLUDE_DJ:
+                    safe_stdout("\rExcluded DJ detected, skipping %s" % new_dj)
+                    time.sleep(DJ_CHECK_INTERVAL)
+                    continue
+                dj = new_dj
+                safe_stdout("\r%s" % WHITE_SPACE)
+                to_write = "DJ %s has taken over the stream.\n" % dj
+                safe_stdout("\r%s" % to_write)
+                cue_file.write(to_write)
+                swap_djs(location, dj, dj_dict)
+                dj_found = True
 
     try:
         while not panic_lock.acquire(blocking=0):
-            if not sleepy_end and time.time() - last_check > SONG_CHECK_INTERVAL:
-                old_title = stream_data.title
-                stream_data.update()
-                if old_title != stream_data.title:
-                    sleepy_end = True
-                    last_check = time.time()
-                else:
-                    last_check = time.time()
-            if sleepy_end and time.time() - last_check > STREAM_LAG:
-                printer_lock.release()
-                writer_lock.release()
-                if end_on_finish:
-                    return False, False
-                else:
-                    return True, False
+            stream_data.update()
+            if stream_data.title != current_title:
+                tag = "COMPLETE"
+                if start:
+                    tag = "INCOMPLETE"
+                    start = False
+                to_write = "%s %s %s\n" % (tag, current_title, int(time.time() - song_start))
+                cue_file.write(to_write.encode("utf-8"))
+                safe_stdout("\r%s" % WHITE_SPACE)
+                safe_stdout("\rRecorded %s %s" % (current_title, format_seconds(time.time() - song_start)))
+                safe_stdout("\n")
+                song_start = time.time()
+                base_print = "\rRecording: %s" % stream_data.title
+                current_title = stream_data.title
+                if CHECK_FOR_DJ:
+                    new_dj = get_dj()
+                    if new_dj != dj:
+                        if new_dj in EXCLUDE_DJ:
+                            safe_stdout("\rExcluded DJ detected, skipping %s" % new_dj)
+                            raise KeyboardInterrupt
+                        dj = new_dj
+                        safe_stdout("\r%s" % WHITE_SPACE)
+                        to_write = "DJ %s has taken over the stream.\n" % dj
+                        safe_stdout("\rDJ %s has taken over the stream." % dj)
+                        safe_stdout("\n")
+                        cue_file.write(to_write)
+                        swap_djs(location, dj)
+            safe_stdout("\r%s %s" % (base_print, format_seconds(time.time() - song_start)))
+            time.sleep(SONG_CHECK_INTERVAL)
     except KeyboardInterrupt:
-        printer_lock.release()
+        to_write = "INCOMPLETE %s %s\n" % (current_title, int(time.time() - song_start))
+        cue_file.write(to_write.encode("utf-8"))
         writer_lock.release()
-        return False, True
-    printer_lock.release()
+        cue_file.close()
+        return False
     writer_lock.release()
-    return True, True
+    cue_file.close()
+    return True
 
 
 def safe_query(query):
@@ -229,6 +264,7 @@ def load_args():
     Load command line arguments
     """
     i = 1
+    config_data = {}
     while i < len(sys.argv):
         arg = sys.argv[i]
         if arg in VALID_ARGS:
@@ -277,25 +313,15 @@ def load_args():
             elif arg == "-np_element":
                 config_data['np_element'] = sys.argv[i + 1]
                 i += 1
-            elif arg == "-cue_only":
-                config_data['cue_only'] = True
 
         i += 1
     return config_data
 
 
-def join_str_with_char(iterable, ch):
-    i = 1
-    whole = iterable[0]
-    while i < len(iterable):
-        whole += ch + iterable[i]
-    return whole
-
-
 def extract_xsl_from_link(link):
     split_link = link.split("/")
     split_link[-1] = ICECAST_STATUS_LOCATION
-    return join_str_with_char(split_link, "/")
+    return '/'.join(split_link)
 
 
 def save_config(config):
@@ -369,24 +395,7 @@ def optional_config(config):
         NP_ELEMENT = np_element
     if cue:
         global CUE_ONLY
-        CUE_ONLY = cue_only
-
-
-def tag_file(title, artist, track_number, file_name, folder_name, dj_name, image_ext):
-    audio = EasyID3()
-    audio["title"] = title
-    audio["artist"] = artist
-    audio["album"] = folder_name.split(" ")[0]
-    audio["albumartist"] = dj_name
-    audio["tracknumber"] = str(track_number)
-    audio["date"] = str(int(time.time()))
-    audio.save(file_name)
-    tags = ID3(file_name)
-    tags["COMM"] = COMM(encoding=3, lang=u'eng', desc='desc', text=u'Recorded with stream_saver')
-    with open(os.path.join(folder_name, "%s.%s" % (DJ_ART, image_ext)), "rb") as dj_image:
-        tags["APIC"] = APIC(encoding=3, mime='image/%s' % image_ext, type=3, desc="Cover",
-                            data=dj_image.read())
-    tags.save()
+        CUE_ONLY = True
 
 
 def wait_on_file_rename(file_name, new_name):
@@ -404,91 +413,92 @@ def wait_on_file_rename(file_name, new_name):
                 quit()
 
 
-def recording_loop(request, stream_data, stream_url):
-    dj_name = ""
-    first_run = True
-    continue_recording = True
-    folder_name = str(int(time.time()))
-    track_number = 1
-    dj_image_extension = ""
-    if not CHECK_FOR_DJ:
-        os.mkdir(os.path.join(FILE_PATH, folder_name))
-    while continue_recording:
-        if CHECK_FOR_DJ:
-            new_dj_name = get_dj()
-            if new_dj_name in EXCLUDE_DJ:
-                safe_stdout("\rExcluded DJ detected, skipping %s" % new_dj_name)
-                time.sleep(DJ_CHECK_INTERVAL)
-                continue
-            if dj_name != new_dj_name:
-                track_number = 1
-                dj_name = new_dj_name
-                folder_name = "%s %s" % (int(time.time()), dj_name)
-                os.mkdir(os.path.join(FILE_PATH, folder_name))
-                safe_stdout("\nCurrent DJ: %s\n" % dj_name)
-                dj_image_url = get_dj_art()
-                response = requests.get(dj_image_url, stream=True)
-                with open(os.path.join(folder_name, DJ_ART), "wb") as image:
-                    for chunk in response:
-                        image.write(chunk)
-                        dj_image_extension = imghdr.what(os.path.join(folder_name, DJ_ART))
-                wait_on_file_rename(os.path.join(folder_name, DJ_ART),
-                                    os.path.join(folder_name, "%s.%s" % (DJ_ART, dj_image_extension)))
-        file_name = make_file_name(stream_data.title, folder_name, False)
-        rename_attempt = 1
-        while os.path.isfile(file_name):
-            file_name = make_file_name("%s_%d" % (stream_data.title, rename_attempt), folder_name, False)
-            rename_attempt += 1
-        old_title = stream_data.title
-        continue_recording, incomplete = begin_recording(stream_data, file_name, request, "wb")
+def recording_loop(request, stream_data):
+    do_continue = True
+    while do_continue:
+        dj_dict = {}
+        folder_name = str(int(time.time()))
+        location = os.path.join(FILE_PATH, folder_name)
+        os.mkdir(location)
         try:
-            artist, title = old_title.split(" - ")
-        except ValueError:
-            artist = title = ""
-            safe_stdout("\nfailed to get artist - title from %s\n" % old_title)
-        tag_file(title, artist, track_number, file_name, folder_name, dj_name, dj_image_extension)
-        track_number += 1
-        safe_stdout(WHITE_SPACE)
-        if incomplete or not continue_recording or first_run:
-            new_file_name = make_file_name(old_title, folder_name, True)
-            wait_on_file_rename(file_name, new_file_name)
-            safe_stdout("\rPartially Recorded: %s\n" % old_title)
-            first_run = False
+            do_continue = begin_recording(stream_data, location, request, dj_dict)
+        finally:
+            post_split(folder_name, dj_dict)
+
+
+class Song:
+    def __init__(self, raw_title, duration, dj, incomplete):
+        self.raw_title = raw_title
+        self.duration = duration
+        self.dj = dj
+        self.incomplete = incomplete
+
+    def get_title(self):
+        if len(self.raw_title.split('-')) == 2:
+            return self.raw_title.split('-')[1]
+        return self.raw_title
+
+    def get_artist(self):
+        if len(self.raw_title.split('-')) == 2:
+            return self.raw_title.split('-')[0]
+        if self.dj:
+            return self.dj
+        return ''
+
+
+def tag_song(song, track_number, file_name, folder_name, dj_dict):
+    audio = EasyID3()
+    audio["title"] = song.get_title()
+    audio["artist"] = song.get_artist()
+    audio["albumartist"] = song.dj
+    audio["album"] = os.path.dirname(file_name)
+    audio["album"] = file_name
+    audio["tracknumber"] = str(track_number)
+    audio["date"] = str(int(time.time()))
+    audio.save(file_name)
+    tags = ID3(file_name)
+    tags["COMM"] = COMM(encoding=3, lang=u'eng', desc='desc', text=u'Recorded with stream_saver')
+    with open(os.path.join(folder_name, "%s.%s" % (song.dj, dj_dict[song.dj])), "rb") as dj_image:
+        tags["APIC"] = APIC(encoding=3, mime='image/%s' % dj_dict[song.dj], type=3, desc="Cover",
+                            data=dj_image.read())
+    tags.save()
+
+
+def post_split(folder, dj_dict):
+    bloc_name = os.path.join(folder, 'recording_bloc.mp3')
+    cue_name = os.path.join(folder, 'cue_file.txt')
+    song_list = []
+    dj = ''
+    with open(cue_name, 'r') as cue_file:
+        for line in cue_file.readlines():
+            split_line = line.split(' ')
+            if split_line[0] == "DJ":
+                dj = ' '.join(split_line[1:-5])
+            elif split_line[0] == "COMPLETE":
+                song_list.append(Song(' '.join(split_line[1:-1]).decode('utf-8'), split_line[-1], dj.decode('utf-8'),
+                                      False))
+            elif split_line[0] == "INCOMPLETE":
+                song_list.append(Song(' '.join(split_line[1:-1]).decode('utf-8'), split_line[-1], dj.decode('utf-8'),
+                                      True))
+    with open(bloc_name, 'rb') as b:
+        bloc_file = b.read()
+    last_start = 0
+    index = 1
+    for song in song_list:
+        duration = int(float(song.duration)) * BITRATE_MOD
+        if song == song_list[0]:
+            duration -= int(round(STREAM_DELAY * BITRATE_MOD))
+        if song == song_list[-1]:
+            song_data = bloc_file[last_start:]
         else:
-            safe_stdout("\rRecorded: %s\n" % old_title)
-        request = requests.get(stream_url, stream=True)
-
-
-def cue_interval(stream_data, cue):
-    c_title = ""
-    if CHECK_FOR_DJ:
-        dj = ""
-    while True:
-        stream_data.update()
-        if stream_data.title != c_title:
-            c_title = stream_data.title
-            if CHECK_FOR_DJ:
-                new_dj = get_dj()
-                if new_dj != dj:
-                    dj = new_dj
-                    to_write = "%s has taken over the stream.\n" % dj
-                    safe_stdout(to_write)
-                    cue.write(to_write)
-            to_write = "%s (%s)\n" % (c_title, int(time.time()))
-            safe_stdout(to_write)
-            cue.write(to_write.encode("utf-8"))
-        time.sleep(60)
-
-
-def cue_only(stream_data):
-    cue_file_name = "%s stream cue %s.txt" % (stream_data.server_name, int(time.time()))
-    cue_file_name = re.sub("[<>:\"/\\\|?*]", "", cue_file_name)
-    with open(cue_file_name, "w") as cue_file:
-        try:
-            cue_interval(stream_data, cue_file)
-        except KeyboardInterrupt:
-            print "Exiting Program"
-    quit()
+            song_data = bloc_file[last_start:last_start+duration]
+            last_start += duration
+        file_name = make_file_name("%s. %s" % (index, song.raw_title), folder, song.incomplete)
+        with open(file_name, 'wb') as new_song:
+            new_song.write(song_data)
+        tag_song(song, index, file_name, folder, dj_dict)
+        index += 1
+    os.remove(bloc_name)
 
 
 def setup():
@@ -500,15 +510,16 @@ def setup():
     stream_data = StreamData(stream_xsl)
     stream_data.update()
     d = time.time()
-    # disabling stream lag till a proper test can be run to confirm the results actually help
-    # global STREAM_LAG
-    # STREAM_LAG = d - a
+    """
+    global STREAM_DELAY
+    STREAM_DELAY = (d - a) * 2
+    print STREAM_DELAY
+    """
+    global BITRATE_MOD
+    BITRATE_MOD = int(BITRATE_MOD * stream_data.bitrate)
     return request, stream_data, stream_url
 
 
 if __name__ == "__main__":
     setup_request, setup_data, setup_url = setup()
-    if CUE_ONLY:
-        cue_only(setup_data)
-    else:
-        recording_loop(setup_request, setup_data, setup_url)
+    recording_loop(setup_request, setup_data)
