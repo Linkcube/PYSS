@@ -11,7 +11,7 @@ from pyquery import PyQuery
 import threading
 
 BLOCK_SIZE = 1024 # bytes
-DJ_CHECK_INTERVAL = 60.0  # seconds
+DJ_CHECK_INTERVAL = 5.0  # seconds
 FILE_PATH = ""
 INVALID_CHARACTERS = "<>:\"/\\|?*"
 EXTENSION = "mp3"
@@ -33,7 +33,8 @@ SONG_CHECK_INTERVAL = .5
 DJ_DICT = {}
 BITRATE_MOD = 1024 / 8
 STREAM_DELAY = 2  # seems to be the normal value
-CLI_LIMIT = 70
+CLI_LIMIT = 60
+MP3_CORRECTION = 1.024
 
 
 class StreamData:
@@ -88,7 +89,7 @@ class StreamData:
 def get_stream_data():
     xsl = requests.get("http://stream.r-a-d.io/status-json.xsl")
     data = xsl.json()['icestats']['source'][1]
-    # bitrate = xsl.json()['icestats']['source'][0]["bitrate"]
+    bitrate = xsl.json()['icestats']['source'][0]["bitrate"]
     stream_data = StreamData(data)
     return stream_data
 
@@ -156,7 +157,6 @@ def begin_recording(stream_data, location, request, dj_dict):
     start = True
 
     cue_file = open(os.path.join(location, "cue_file.txt"), 'w')
-
     if CHECK_FOR_DJ:
         dj_found = False
         while not dj_found:
@@ -202,7 +202,7 @@ def begin_recording(stream_data, location, request, dj_dict):
                         safe_stdout("\rDJ %s has taken over the stream." % dj)
                         safe_stdout("\n")
                         cue_file.write(to_write)
-                        swap_djs(location, dj)
+                        swap_djs(location, dj, dj_dict)
             safe_stdout("\r%s %s" % (base_print, format_seconds(time.time() - song_start)))
             time.sleep(SONG_CHECK_INTERVAL)
     except KeyboardInterrupt:
@@ -210,8 +210,10 @@ def begin_recording(stream_data, location, request, dj_dict):
         cue_file.write(to_write.encode("utf-8"))
         writer_lock.release()
         cue_file.close()
+        writer.join()
         return False
     writer_lock.release()
+    writer.join()
     cue_file.close()
     return True
 
@@ -415,15 +417,15 @@ def wait_on_file_rename(file_name, new_name):
 
 def recording_loop(request, stream_data):
     do_continue = True
-    while do_continue:
-        dj_dict = {}
-        folder_name = str(int(time.time()))
-        location = os.path.join(FILE_PATH, folder_name)
-        os.mkdir(location)
-        try:
+    dj_dict = {}
+    folder_name = str(int(time.time()))
+    location = os.path.join(FILE_PATH, folder_name)
+    os.mkdir(location)
+    try:
+        while do_continue:
             do_continue = begin_recording(stream_data, location, request, dj_dict)
-        finally:
-            post_split(folder_name, dj_dict)
+    finally:
+        post_split(folder_name, dj_dict)
 
 
 class Song:
@@ -485,20 +487,37 @@ def post_split(folder, dj_dict):
     last_start = 0
     index = 1
     for song in song_list:
-        duration = int(float(song.duration)) * BITRATE_MOD
-        if song == song_list[0]:
-            duration -= int(round(STREAM_DELAY * BITRATE_MOD))
         if song == song_list[-1]:
             song_data = bloc_file[last_start:]
         else:
-            song_data = bloc_file[last_start:last_start+duration]
+            duration = float(song.duration)
+            if song == song_list[0]:
+                duration += STREAM_DELAY * 3
+            else:
+                duration += 0
+            duration = int(duration * BITRATE_MOD/ MP3_CORRECTION)
+            song_data = bloc_file[last_start:last_start + duration]
             last_start += duration
         file_name = make_file_name("%s. %s" % (index, song.raw_title), folder, song.incomplete)
         with open(file_name, 'wb') as new_song:
             new_song.write(song_data)
         tag_song(song, index, file_name, folder, dj_dict)
         index += 1
-    os.remove(bloc_name)
+    try:
+        os.remove(bloc_name)
+    except OSError:
+        print "Could not delete bloc file"
+
+
+def get_avg_delay(stream_xsl):
+    summ = 0
+    for x in range(4):
+        a = time.time()
+        stream_data = StreamData(stream_xsl)
+        stream_data.update()
+        d = time.time()
+        summ += d - a
+    return summ / 4.0
 
 
 def setup():
@@ -506,17 +525,15 @@ def setup():
     stream_url, stream_xsl = verify_config(config_data)
     optional_config(config_data)
     request = requests.get(stream_url, stream=True)
-    a = time.time()
     stream_data = StreamData(stream_xsl)
     stream_data.update()
-    d = time.time()
-    """
+    safe_stdout("Connected to %s\n" % stream_data.server_name)
+    safe_stdout("%s\n" % stream_data.server_description)
+
     global STREAM_DELAY
-    STREAM_DELAY = (d - a) * 2
-    print STREAM_DELAY
-    """
+    STREAM_DELAY = get_avg_delay(stream_xsl) * 12
     global BITRATE_MOD
-    BITRATE_MOD = int(BITRATE_MOD * stream_data.bitrate)
+    BITRATE_MOD = 1024 * stream_data.bitrate / 8
     return request, stream_data, stream_url
 
 
