@@ -157,19 +157,7 @@ def begin_recording(stream_data, location, request):
     """
     Returns first whether to continue recording, and secondly if the recording is incomplete.
     """
-    # TODO change over to tracking bits during recording rather than just time
-    base_print = "\rRecording: %s" % stream_data.title
-    writer_lock = threading.RLock()
-    writer_lock.acquire()
-    panic_lock = threading.RLock()
-    writer = threading.Thread(target=record_stream, args=(location, request, writer_lock, panic_lock))
-    writer.daemon = True
-    writer.start()
-    current_title = stream_data.title
     dj = ""
-    song_start = time.time()
-    start = True
-
     cue_file = open(os.path.join(location, "cue_file.txt"), 'w')
     cue_file.write("Bitrate: %s\n" % stream_data.bitrate)
     if CHECK_FOR_DJ:
@@ -189,6 +177,17 @@ def begin_recording(stream_data, location, request):
                 safe_stdout("\n")
                 cue_file.write(to_write)
                 dj_found = True
+
+    base_print = "\rRecording: %s" % stream_data.title
+    writer_lock = threading.RLock()
+    writer_lock.acquire()
+    panic_lock = threading.RLock()
+    writer = threading.Thread(target=record_stream, args=(location, request, writer_lock, panic_lock))
+    writer.daemon = True
+    writer.start()
+    current_title = stream_data.title
+    song_start = time.time()
+    start = True
 
     try:
         while not panic_lock.acquire(blocking=0):
