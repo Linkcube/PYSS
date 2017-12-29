@@ -8,6 +8,7 @@ from requests.exceptions import ConnectionError
 from pyquery import PyQuery
 import threading
 from split import post_split
+import codecs
 
 BLOCK_SIZE = 1024 # bytes
 DJ_CHECK_INTERVAL = 5.0  # seconds
@@ -64,7 +65,7 @@ class StreamData:
                     raise KeyboardInterrupt
                 if 0 < TIMEOUT < time.time() - start:
                     safe_stdout("\nUpdate stream exceeded timeout limit, exiting program")
-                    time.sleep(1)
+                    raise KeyboardInterrupt
                 safe_stdout("\rError in updating stream, waiting..\n")
                 time.sleep(SONG_CHECK_INTERVAL)
 
@@ -101,7 +102,7 @@ def safe_stdout(to_print):
         sys.stdout.write(to_print[:CLI_LIMIT])
     # TODO change to accurate exception
     except:
-        sys.stdout.write(to_print.decode('utf-8')[:CLI_LIMIT])
+        sys.stdout.write(to_print.encode('ascii', errors='ignore')[:CLI_LIMIT])
     sys.stdout.flush()
 
 
@@ -158,7 +159,7 @@ def begin_recording(stream_data, location, request):
     Returns first whether to continue recording, and secondly if the recording is incomplete.
     """
     dj = ""
-    cue_file = open(os.path.join(location, "cue_file.txt"), 'w')
+    cue_file = codecs.open(os.path.join(location, "cue_file.txt"), encoding='utf-8', mode='w')
     cue_file.write("Bitrate: %s\n" % stream_data.bitrate)
     if CHECK_FOR_DJ:
         dj_found = False
@@ -209,7 +210,8 @@ def begin_recording(stream_data, location, request):
                     new_dj = get_dj()
                     if new_dj != dj:
                         if new_dj in EXCLUDE_DJ:
-                            safe_stdout("\rExcluded DJ detected, skipping %s" % new_dj)
+                            safe_stdout("Excluded DJ detected, skipping %s\n" % new_dj)
+                            safe_stdout("Starting new stream block..\n")
                             raise KeyboardInterrupt
                         dj = new_dj
                         extension = swap_djs(location, dj)

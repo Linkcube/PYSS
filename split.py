@@ -13,6 +13,9 @@ stream.
 import time, os, re
 from mutagen.id3 import ID3, TIT2, TPE1, COMM, APIC
 from mutagen.easyid3 import EasyID3
+import codecs
+from pydub import AudioSegment
+from pydub.silence import split_on_silence
 
 EXTENSION = "mp3"
 BITRATE_MOD = 1024 / 8
@@ -44,8 +47,7 @@ def tag_song(song, track_number, file_name, folder_name, dj_dict):
     audio["title"] = song.get_title()
     audio["artist"] = song.get_artist()
     audio["albumartist"] = song.dj
-    audio["album"] = os.path.dirname(file_name)
-    audio["album"] = file_name
+    audio["album"] = os.path.dirname(folder_name)
     audio["tracknumber"] = str(track_number)
     audio["date"] = str(int(time.time()))
     audio.save(file_name)
@@ -69,47 +71,44 @@ def make_file_name(title, folder, incomplete):
     return name
 
 
-def post_split(folder, delay):
+def post_split(folder):
     bloc_name = os.path.join(folder, 'recording_bloc.mp3')
     cue_name = os.path.join(folder, 'cue_file.txt')
     song_list = []
     dj = ''
     dj_dict = {}
     bit_rate = 192
-    with open(cue_name, 'r') as cue_file:
+    with codecs.open(cue_name, encoding='utf-8', mode='r') as cue_file:
         for line in cue_file.readlines():
             split_line = line.split(' ')
             if split_line[0] == "DJ":
                 dj = ' '.join(split_line[1:-6])
                 dj_dict[dj] = split_line[-1][:-1]
             elif split_line[0] == "COMPLETE":
-                song_list.append(Song(' '.join(split_line[1:-1]).decode('utf-8'), split_line[-1], dj.decode('utf-8'),
-                                      False))
+                song_list.append(Song(' '.join(split_line[1:-1]), split_line[-1][:-1], dj,  False))
             elif split_line[0] == "INCOMPLETE":
-                song_list.append(Song(' '.join(split_line[1:-1]).decode('utf-8'), split_line[-1], dj.decode('utf-8'),
-                                      True))
+                song_list.append(Song(' '.join(split_line[1:-1]), split_line[-1][:-1], dj,  True))
             elif split_line[0] == "Bitrate:":
                 bit_rate = int(split_line[1][:-1])
-    with open(bloc_name, 'rb') as b:
-        bloc_file = b.read()
+    recording_block = AudioSegment.from_mp3(bloc_name)
     last_start = 0
     index = 1
     for song in song_list:
         if song == song_list[-1]:
-            song_data = bloc_file[last_start:]
+            sound_chunk = recording_block[int(last_start * 1000):]
         else:
-            duration = float(song.duration)
-            if song == song_list[0]:
-                duration += delay
-            else:
-                duration += 0
-            duration = int(duration * bit_rate * BITRATE_MOD / MP3_CORRECTION)
-            song_data = bloc_file[last_start:last_start + duration]
-            last_start += duration
+            sound_chunk = recording_block[int(last_start * 1000):int((last_start + float(song.duration)) * 1000) + 10000]
+            last_start += float(song.duration)
+        chunks = split_on_silence(sound_chunk, min_silence_len=2000, silence_thresh=-80)
         file_name = make_file_name("%s. %s" % (index, song.raw_title), folder, song.incomplete)
-        with open(file_name, 'wb') as new_song:
-            new_song.write(song_data)
-        tag_song(song, index, file_name, folder, dj_dict)
+        tags = {"artist": song.get_artist(), "title": song.get_title(), "albumartist": song.dj,
+                "album": os.path.dirname(folder), "track": str(index), "comments": "Recorded with PYSS"}
+        dj_image = os.path.join(folder, "%s.%s" % (song.dj, dj_dict[song.dj]))
+        chunk_index = 1
+        if song == song_list[0] or len(chunks) == 1:
+            chunk_index = 0
+        chunks[chunk_index].export(os.path.join(folder, file_name), format=EXTENSION, bitrate="%sk" % bit_rate,
+                                   tags=tags, cover=dj_image)
         index += 1
     """"
     try:
@@ -120,6 +119,5 @@ def post_split(folder, delay):
 
 if __name__ == '__main__':
     target_folder = raw_input("Enter folder: ")
-    target_delay = float(raw_input("Enter delay: "))
 
-    post_split(target_folder, target_delay)
+    post_split(os.path.join(os.getcwd(), target_folder))
