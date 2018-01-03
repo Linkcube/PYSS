@@ -2,8 +2,7 @@ Python Stream Saver
 
 This is a simple internet radio downloader, currently not stable enough so there's probably better alternatives. This is mainly just to keep track of progress and whatnot.
 
-While this currently only supports Icecast 2.x streams in mp3, in future builds it should be able to support more standards such as Shoutcast, as well as change the
-audio extension to whatever the stream is using.
+Currently supports Icecast 2.x
 
 CMD use:
 +	load config_name
@@ -46,3 +45,9 @@ CMD use:
 
 		the page element to scrape for the DJs name
 		 defaults to none
++	cue_only
+
+
+
+		Doesn't record any of the audio stream, only a text file of what songs and dj's appeared.
+		defaults to False
