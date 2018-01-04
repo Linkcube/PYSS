@@ -34,7 +34,6 @@ SONG_CHECK_INTERVAL = .5
 CLI_LIMIT = 79
 INDEX = 0
 RESTART_ON_DJ_CHANGE = True
-STREAM_DELAY = 0
 PREVIOUS_SNIP = None
 SILENCE_CHECK = 100
 
@@ -207,21 +206,23 @@ def swap_djs(location, name):
 
 
 def process_raw_song(song):
-    global STREAM_DELAY, PREVIOUS_SNIP
+    global PREVIOUS_SNIP
     time.sleep(1)
+    sample_duration = 10 * 1000
     raw_song = AudioSegment.from_file(song.raw_segment, song.extension)
-    if song.index == 0:
-        sample_range = raw_song[-10:]
-        ranges = detect_silence(sample_range, min_silence_len=SILENCE_CHECK, silence_thresh=-80)
-        if not ranges:
-            STREAM_DELAY = -1
-        else:
-            STREAM_DELAY = ranges[-1][1] - len(sample_range)
-    post = raw_song[:STREAM_DELAY]
+    if len(raw_song) < sample_duration:
+        sample_duration = len(raw_song)
+    sample_range = raw_song[-1 * sample_duration:]
+    ranges = detect_silence(sample_range, min_silence_len=SILENCE_CHECK, silence_thresh=-80)
+    if ranges:
+        delay = len(raw_song) - (ranges[-1][1] - sample_duration)
+    else:
+        delay = len(raw_song)
+    post = raw_song[:delay]
     if PREVIOUS_SNIP:
         post = PREVIOUS_SNIP + post
     post.export(song.destination_file, format=song.extension, bitrate="%sk" % song.bitrate)
-    PREVIOUS_SNIP = raw_song[STREAM_DELAY:]
+    PREVIOUS_SNIP = raw_song[delay:]
     audio = EasyID3()
     audio["title"] = song.title
     audio["artist"] = song.artist
@@ -230,10 +231,11 @@ def process_raw_song(song):
     audio["tracknumber"] = str(song.index)
     audio["date"] = str(int(time.time()))
     audio.save(song.destination_file)
-    tags = ID3(song.destination_file)
-    with open(song.dj_image, "rb") as image:
-        tags["APIC"] = APIC(encoding=3, mime='image/%s' % song.dj_extension, type=3, desc="Cover", data=image.read())
-    tags.save()
+    if CHECK_FOR_DJ:
+        tags = ID3(song.destination_file)
+        with open(song.dj_image, "rb") as image:
+            tags["APIC"] = APIC(encoding=3, mime='image/%s' % song.dj_extension, type=3, desc="Cover", data=image.read())
+        tags.save()
     os.remove(song.raw_segment)
 
 
@@ -241,7 +243,8 @@ def begin_recording(stream_data, location, request):
     """
     Returns first whether to continue recording, and secondly if the recording is incomplete.
     """
-    global INDEX
+    global INDEX, PREVIOUS_SNIP
+    PREVIOUS_SNIP = None
     INDEX = 0
     dj = ""
     dj_ext = ""
