@@ -71,7 +71,7 @@ class StreamData:
             except Exception as e:
                 if type(e) == KeyboardInterrupt:
                     raise KeyboardInterrupt
-                if 10 < time.time() - start:
+                if 0 < TIMEOUT < time.time() - start:
                     raise RequestException
                 safe_stdout("\rError in updating stream, probably a dj change..")
                 time.sleep(SONG_CHECK_INTERVAL)
@@ -359,7 +359,7 @@ def begin_recording(stream_data, stream_url):
             if song_processing and song_processing.is_alive():
                 song_processing.join()
             current_song = SongData(INDEX, location, current_title, audio_extension, dj, dj_ext, bitrate,
-                                    float(time.time() - song_start))
+                                    float(time.time() - song_start), album)
             song_processing = threading.Thread(target=process_raw_song, args=(current_song,))
             song_processing.start()
             song_processing.join()
@@ -373,7 +373,7 @@ def begin_recording(stream_data, stream_url):
     if song_processing and song_processing.is_alive():
         song_processing.join()
     current_song = SongData(INDEX, location, current_title, audio_extension, dj, dj_ext, bitrate,
-                            float(time.time() - song_start))
+                            float(time.time() - song_start), album)
     song_processing = threading.Thread(target=process_raw_song, args=(current_song,))
     song_processing.start()
     song_processing.join()
