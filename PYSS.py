@@ -17,7 +17,7 @@ from pydub.silence import detect_silence
 from mutagen.id3 import ID3, APIC
 from mutagen.easyid3 import EasyID3
 
-BLOCK_SIZE = 1024 # bytes
+BLOCK_SIZE = 1024  # bytes
 DJ_CHECK_INTERVAL = 5.0  # seconds
 FILE_PATH = os.getcwd()
 INVALID_CHARACTERS = "<>:\"/\\|?*"
@@ -177,11 +177,15 @@ def record_stream(location, request, lock, panic):
         return
     try:
         for block in request.iter_content(chunk_size=1024):
+            if block is None:
+                print "Recieved 0 bytes from stream."
+                panic.release()
             with open(os.path.join(location, "track_%s" % INDEX), 'ab') as f:
                 f.write(block)
             if lock.acquire(blocking=0):
                 return
-    except requests.exceptions.ChunkedEncodingError:
+    except Exception as e:  #.exceptions.ChunkedEncodingError:
+        print e.message
         panic.release()
 
 
@@ -218,18 +222,27 @@ def process_raw_song(song):
     global PREVIOUS_SNIP, STREAM_DELAY
     time.sleep(1)
     sample_duration = 10 * 1000
-    raw_song = AudioSegment.from_file(song.raw_segment, song.extension)
+    try:
+        raw_song = AudioSegment.from_file(song.raw_segment, song.extension)
+    except IOError as e:
+        print "ERROR!!! File not found"
+        print e.message
+        return
     if len(raw_song) < sample_duration:
         sample_duration = len(raw_song)
     sample_range = raw_song[-1 * sample_duration:]
     ranges = detect_silence(sample_range, min_silence_len=SILENCE_CHECK, silence_thresh=-80)
     if ranges:
         STREAM_DELAY = ranges[-1][1] - sample_duration
-    post = raw_song[:STREAM_DELAY]
+    if STREAM_DELAY == 0:
+        post = raw_song
+    else:
+        post = raw_song[:STREAM_DELAY]
     if PREVIOUS_SNIP:
         post = PREVIOUS_SNIP + post
     post.export(song.destination_file, format=song.extension, bitrate="%sk" % song.bitrate)
-    PREVIOUS_SNIP = raw_song[STREAM_DELAY:]
+    if STREAM_DELAY > 0:
+        PREVIOUS_SNIP = raw_song[STREAM_DELAY:]
     audio = EasyID3()
     audio["title"] = song.title
     audio["artist"] = song.artist
@@ -314,14 +327,14 @@ def begin_recording(stream_data, stream_url):
                 to_write = "%s %s\n" % (current_title, format_seconds(time.time() - song_start))
                 cue_file.write(to_write)
                 safe_stdout(WHITE_SPACE)
-                if not CUE_ONLY and not roll_over:
-                    current_song = SongData(INDEX, location, current_title, audio_extension, dj, dj_ext, bitrate,
+                INDEX += 1
+                if not CUE_ONLY:
+                    current_song = SongData(INDEX - 1, location, current_title, audio_extension, dj, dj_ext, bitrate,
                                             float(time.time() - song_start), album)
                     song_processing = threading.Thread(target=process_raw_song, args=(current_song,))
                     song_processing.start()
                 if roll_over:
                     roll_over = False
-                INDEX += 1
                 safe_stdout("\r%.3d. %s" % (INDEX, stream_data.title))
                 safe_stdout('\n')
                 song_start = time.time()
@@ -370,15 +383,16 @@ def begin_recording(stream_data, stream_url):
         safe_stdout("Starting new stream block..\n")
     except RequestException:
         safe_stdout("\nError in the query, restarting recording..\n")
-    if song_processing and song_processing.is_alive():
-        song_processing.join()
-    current_song = SongData(INDEX, location, current_title, audio_extension, dj, dj_ext, bitrate,
-                            float(time.time() - song_start), album)
-    song_processing = threading.Thread(target=process_raw_song, args=(current_song,))
-    song_processing.start()
-    song_processing.join()
     writer_lock.release()
     writer.join()
+    if song_processing and song_processing.is_alive():
+        song_processing.join()
+    if not CUE_ONLY:
+        current_song = SongData(INDEX, location, current_title, audio_extension, dj, dj_ext, bitrate,
+                                float(time.time() - song_start), album)
+        song_processing = threading.Thread(target=process_raw_song, args=(current_song,))
+        song_processing.start()
+        song_processing.join()
     if not CUE_ONLY:
         if song_processing and song_processing.is_alive():
             song_processing.join()
@@ -393,8 +407,7 @@ def safe_query(query):
         except ConnectionError or HTTPError as e:
             if 0 < TIMEOUT < time.time() - start:
                 print ("\nPyQuery timed out with the following message: %s" % e.message)
-                safe_stdout("\nQuitting the program now..")
-                raise KeyboardInterrupt
+                raise RequestException
             time.sleep(1.0)
 
 
