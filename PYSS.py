@@ -9,6 +9,7 @@ import re
 import threading
 import codecs
 import requests
+import httplib
 from requests.exceptions import ConnectionError
 from urllib2 import HTTPError
 from pyquery import PyQuery
@@ -16,6 +17,7 @@ from pydub import AudioSegment
 from pydub.silence import detect_silence
 from mutagen.id3 import ID3, APIC
 from mutagen.easyid3 import EasyID3
+from pydub.exceptions import TooManyMissingFrames
 
 BLOCK_SIZE = 1024  # bytes
 DJ_CHECK_INTERVAL = 5.0  # seconds
@@ -184,7 +186,7 @@ def record_stream(location, request, lock, panic):
                 f.write(block)
             if lock.acquire(blocking=0):
                 return
-    except Exception as e:  #.exceptions.ChunkedEncodingError:
+    except requests.exceptions.ChunkedEncodingError or httplib.IncompleteRead as e:
         print e.message
         panic.release()
 
@@ -228,20 +230,25 @@ def process_raw_song(song):
         print "ERROR!!! File not found"
         print e.message
         return
+    if PREVIOUS_SNIP:
+        raw_song = PREVIOUS_SNIP + raw_song
     if len(raw_song) < sample_duration:
         sample_duration = len(raw_song)
     sample_range = raw_song[-1 * sample_duration:]
-    ranges = detect_silence(sample_range, min_silence_len=SILENCE_CHECK, silence_thresh=-80)
+    try:
+        ranges = detect_silence(sample_range, min_silence_len=SILENCE_CHECK, silence_thresh=-80)
+    except TooManyMissingFrames:
+        ranges = None
     if ranges:
         STREAM_DELAY = ranges[-1][1] - sample_duration
     if STREAM_DELAY == 0:
         post = raw_song
     else:
         post = raw_song[:STREAM_DELAY]
-    if PREVIOUS_SNIP:
-        post = PREVIOUS_SNIP + post
     post.export(song.destination_file, format=song.extension, bitrate="%sk" % song.bitrate)
-    if STREAM_DELAY > 0:
+    if STREAM_DELAY == 0:
+        PREVIOUS_SNIP = None
+    else:
         PREVIOUS_SNIP = raw_song[STREAM_DELAY:]
     audio = EasyID3()
     audio["title"] = song.title
