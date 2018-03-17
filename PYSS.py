@@ -22,7 +22,7 @@ from pydub.exceptions import TooManyMissingFrames
 BLOCK_SIZE = 1024  # bytes
 DJ_CHECK_INTERVAL = 5.0  # seconds
 FILE_PATH = os.getcwd()
-INVALID_CHARACTERS = "<>:\"/\\|?*"
+INVALID_CHARACTERS = "<>:\"/\\\|?*"
 EXTENSION = "mp3"
 TIMEOUT = 0
 VALID_ARGS = ["-load", "-save", "-timeout", "-file_path", "-block_size", "-dj_check_interval", "-dj_url",
@@ -411,10 +411,10 @@ def safe_query(query):
     while True:
         try:
             return PyQuery(query)
-        except ConnectionError or HTTPError as e:
+        except:  # ConnectionError or HTTPError as e:
             if 0 < TIMEOUT < time.time() - start:
-                print ("\nPyQuery timed out with the following message: %s" % e.message)
-                raise RequestException
+                print ("\nPyQuery timed out")  # with the following message: %s" % e.message)
+                #raise e
             time.sleep(1.0)
 
 
