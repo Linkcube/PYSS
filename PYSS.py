@@ -1,20 +1,20 @@
 # This program is provided as is, use it at your own risk.
 # Python Icecast Stream Saver
+# ver 1.1.01
 import time
 import os
 import sys
 import json
 import imghdr
-import re
 import threading
+import multiprocessing
 import codecs
 import requests
-import httplib
-from requests.exceptions import ConnectionError
-from urllib2 import HTTPError
+import pickle
 from pyquery import PyQuery
 from pydub import AudioSegment
 from pydub.silence import detect_silence
+from mutagen import MutagenError
 from mutagen.id3 import ID3, APIC
 from mutagen.easyid3 import EasyID3
 from pydub.exceptions import TooManyMissingFrames
@@ -22,7 +22,7 @@ from pydub.exceptions import TooManyMissingFrames
 BLOCK_SIZE = 1024  # bytes
 DJ_CHECK_INTERVAL = 5.0  # seconds
 FILE_PATH = os.getcwd()
-INVALID_CHARACTERS = "<>:\"/\\\|?*"
+KEEP_CHARACTERS = (' ', '.', '_', '-')
 EXTENSION = "mp3"
 TIMEOUT = 0
 VALID_ARGS = ["-load", "-save", "-timeout", "-file_path", "-block_size", "-dj_check_interval", "-dj_url",
@@ -45,6 +45,10 @@ PREVIOUS_SNIP = None
 SILENCE_CHECK = 100
 STREAM_DELAY = 0
 SERVER_TYPES = {"audio/mpeg": "mp3"}
+MAX_DURATION = 900  # 15 minutes
+MAX_TITLE = 200  # max title length, go even less for android
+QUICK_PROC = False
+# Whether to completely calculate the silence for each song or just the first time  (~1 second per song speedup)
 
 
 class StreamData:
@@ -96,7 +100,7 @@ class StreamData:
 
 
 class SongData:
-    def __init__(self, index, location, title, ext, dj, dj_ext, bitrate, duration, album):
+    def __init__(self, index, location, title, ext, dj, dj_ext, bitrate, duration, album, part=0, last_part=False):
         self.index = index
         self.location = location
         self.raw_title = title
@@ -106,7 +110,10 @@ class SongData:
         self.bitrate = bitrate
         self.duration = duration
         self.album = album
+        self.part = part
+        self.last_part = last_part
 
+        # Check if author - title splits cleanly
         if len(self.raw_title.split('-')) == 2:
             self.title = self.raw_title.split('-')[1]
         else:
@@ -119,13 +126,37 @@ class SongData:
         else:
             self.artist = ''
 
+        #  Ensure that parts are unique to an index
+        if part == 0:
+            file_index = self.index
+        else:
+            file_index = "{}.{}".format(self.index, self.part)
+
+        cleaned_title = "".join(c for c in self.raw_title if c.isalnum() or c in KEEP_CHARACTERS).rstrip()
+
         self.raw_segment = os.path.join(self.location, "track_%s" % self.index)
         self.destination_file = os.path.join(self.location, "%s. %s.%s" % (
-            self.index, re.sub('[' + INVALID_CHARACTERS + ']', '', self.raw_title), self.extension))
+            file_index, cleaned_title[:MAX_TITLE], self.extension))
         self.dj_image = os.path.join(self.location, "%s.%s" % (self.dj, self.dj_extension))
         self.file_tags = {"artist": self.artist, "title": self.title, "albumartist": self.dj,
-                          "album": os.path.dirname(self.location), "track": str(self.index),
+                          "album": os.path.dirname(self.location), "track": file_index,
                           "comments": "Recorded with PYSS"}
+        self.index = file_index
+
+    def split(self):
+        duration = self.duration
+        parts = []
+        part_index = 0
+        while duration > MAX_DURATION:
+            parts.append(
+                SongData(self.index, self.location, self.raw_title, self.extension, self.dj, self.dj_extension,
+                         self.bitrate, MAX_DURATION, self.album, part=part_index))
+            duration -= MAX_DURATION
+            part_index += 1
+        parts.append(
+            SongData(self.index, self.location, self.raw_title, self.extension, self.dj, self.dj_extension,
+                     self.bitrate,  duration, self.album, part=part_index, last_part=True))
+        return parts
 
 
 class EasyWrite:
@@ -149,6 +180,44 @@ class RequestException(Exception):
     pass
 
 
+class StreamRecorder():
+    def __init__(self, location):
+        self.location = location
+        self.panic_lock = threading.RLock()
+
+    def _record_stream(self, request, writer_lock):
+        self.panic_lock.acquire()
+        cache_start = time.time()
+        index = 0
+        if CUE_ONLY:
+            time.sleep(1)
+            return
+        try:
+            for block in request.iter_content(chunk_size=1024):
+                if block is None:
+                    print "Recieved 0 bytes from stream."
+                    self.panic_lock.release()
+                if time.time() - MAX_DURATION > cache_start:
+                    cache_start = time.time()
+                    index += 1
+                    with open(os.path.join(self.location, "track_%s" % index), 'wb') as f:
+                        f.write(block)
+                else:
+                    with open(os.path.join(self.location, "track_%s" % index), 'ab') as f:
+                        f.write(block)
+                if writer_lock.acquire(blocking=0):
+                    return
+        except requests.exceptions.ChunkedEncodingError as e: # or httplib.IncompleteRead as e:
+            print e.message
+            self.panic_lock.release()
+
+    def record_stream(self, request, writer_lock):
+        writer = threading.Thread(target=self._record_stream, args=(request, writer_lock))
+        writer.daemon = True
+        writer.start()
+        return self.panic_lock, writer
+
+
 def safe_stdout(to_print):
     """
     Print on any ascii terminal without crashing.
@@ -170,25 +239,6 @@ def format_with_hours(seconds):
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
     return "%02d:%02d:%02d" % (h, m, s)
-
-
-def record_stream(location, request, lock, panic):
-    panic.acquire()
-    if CUE_ONLY:
-        time.sleep(1)
-        return
-    try:
-        for block in request.iter_content(chunk_size=1024):
-            if block is None:
-                print "Recieved 0 bytes from stream."
-                panic.release()
-            with open(os.path.join(location, "track_%s" % INDEX), 'ab') as f:
-                f.write(block)
-            if lock.acquire(blocking=0):
-                return
-    except requests.exceptions.ChunkedEncodingError or httplib.IncompleteRead as e:
-        print e.message
-        panic.release()
 
 
 def wait_on_file_rename(file_name, new_name):
@@ -220,63 +270,137 @@ def swap_djs(location, name):
     return dj_image_extension
 
 
-def process_raw_song(song):
-    global PREVIOUS_SNIP, STREAM_DELAY
-    time.sleep(1)
-    sample_duration = 10 * 1000
-    try:
-        raw_song = AudioSegment.from_file(song.raw_segment, song.extension)
-    except IOError as e:
-        print "ERROR!!! File not found"
-        print e.message
-        return
-    if PREVIOUS_SNIP:
-        raw_song = PREVIOUS_SNIP + raw_song
-    if len(raw_song) < sample_duration:
-        sample_duration = len(raw_song)
-    sample_range = raw_song[-1 * sample_duration:]
-    try:
-        ranges = detect_silence(sample_range, min_silence_len=SILENCE_CHECK, silence_thresh=-80)
-    except TooManyMissingFrames:
-        ranges = None
-    if ranges:
-        STREAM_DELAY = ranges[-1][1] - sample_duration
-    if STREAM_DELAY == 0:
-        post = raw_song
-    else:
-        post = raw_song[:STREAM_DELAY]
-    post.export(song.destination_file, format=song.extension, bitrate="%sk" % song.bitrate)
-    if STREAM_DELAY == 0:
-        PREVIOUS_SNIP = None
-    else:
-        PREVIOUS_SNIP = raw_song[STREAM_DELAY:]
-    audio = EasyID3()
-    audio["title"] = song.title
-    audio["artist"] = song.artist
-    audio["album"] = song.album
-    audio["albumartist"] = song.dj
-    audio["tracknumber"] = str(song.index)
-    audio["date"] = str(int(time.time()))
-    audio.save(song.destination_file)
-    if CHECK_FOR_DJ:
-        tags = ID3(song.destination_file)
-        with open(song.dj_image, "rb") as image:
-            tags["APIC"] = APIC(encoding=3, mime='image/%s' % song.dj_extension, type=3, desc="Cover",
-                                data=image.read())
-        tags.save()
-    os.remove(song.raw_segment)
+class SongProcessor:
+    def __init__(self, cue_path):
+        self.cue_path = cue_path
+        self.unpacker = None
+        self.file_index = 0
+        self.file_progress = 0
+        self.left_over = None
+        self.raw = None
+        self.delay = None
+
+    def _new_proc(self, song, complete):
+        sample_duration = 10 * 1000
+        remaining_duration = song.duration
+
+        # Stick files if at the end of a file
+        if (remaining_duration > self.raw.duration_seconds - self.file_progress and
+                os.path.isfile(os.path.join(song.location, "track_{}".format(self.file_index + 1)))):
+            part_a = self.raw[self.file_progress * 1000:]
+            remaining_duration -= part_a.duration_seconds
+            self.file_index += 1
+            del self.raw
+            self.raw = AudioSegment.from_file(os.path.join(song.location, "track_{}".format(self.file_index)),
+                                              song.extension)
+            if remaining_duration > self.raw.duration_seconds:
+                part_b = self.raw
+            else:
+                part_b = self.raw[:remaining_duration * 1000]
+            raw = part_a + part_b
+            self.file_progress = 0
+        else:
+            if complete:
+                raw = self.raw[self.file_progress * 1000:(self.file_progress + remaining_duration) * 1000]
+            else:
+                raw = self.raw[self.file_progress * 1000:]
+
+        self.file_progress += remaining_duration
+
+        if self.left_over and song.part == 0:
+            raw = self.left_over + raw
+            self.left_over = None
+
+        if song.last_part and complete:
+            if not self.delay or not QUICK_PROC:
+                if raw.duration_seconds > 10:
+                    sample_range = raw[-1 * sample_duration:]
+                else:
+                    sample_range = raw
+                try:
+                    ranges = detect_silence(sample_range, min_silence_len=SILENCE_CHECK, silence_thresh=-80)
+                except TooManyMissingFrames:
+                    ranges = None
+                if ranges:
+                    self.delay = ranges[-1][1] - sample_duration
+                else:
+                    self.delay = 0
+            if self.delay == 0:
+                post = raw
+            else:
+                post = raw[:self.delay]
+                try:
+                    self.left_over = raw[self.delay:]
+                except TooManyMissingFrames:
+                    post = raw
+                    self.left_over = None
+        else:
+            post = raw
+
+        post.export(song.destination_file, format=song.extension, bitrate="%sk" % song.bitrate)
+        audio = EasyID3()
+        audio["title"] = song.title
+        audio["artist"] = song.artist
+        audio["album"] = song.album
+        audio["albumartist"] = song.dj
+        audio["tracknumber"] = str(song.index)
+        audio["date"] = str(int(time.time()))
+        audio.save(song.destination_file)
+        if song.dj_image:
+            tags = ID3(song.destination_file)
+            with open(song.dj_image, "rb") as image:
+                tags["APIC"] = APIC(encoding=3, mime='image/%s' % song.dj_extension, type=3, desc="Cover",
+                                    data=image.read())
+            try:
+                tags.save()
+            except MutagenError:
+                time.sleep(1.0)
+                tags.save()
+
+    def unpack_cue(self):
+        self.delay = None
+        cue_file = open(self.cue_path, 'r')
+        dj_pack = pickle.load(cue_file)
+        if dj_pack[0]:
+            dj = dj_pack[1]
+            dj_ext = dj_pack[2]
+
+        songs = []
+        while True:
+            try:
+                songs.append(pickle.load(cue_file))
+            except EOFError:
+                break
+        cue_file.close()
+        self.raw = AudioSegment.from_file(
+            os.path.join(songs[0][0].location, "track_0"), songs[0][0].extension)
+        for song in songs:
+            for part in song[0].split():
+                self._new_proc(part, song[1])
+        for track in range(0, self.file_index+1):
+            os.remove(os.path.join(songs[0][0].location, "track_{}".format(track)))
+
+    def threaded_unpack(self):
+        self.unpacker = threading.Thread(target=self.unpack_cue)
+        self.unpacker.start()
+
+    def mp_unpack(self):
+        self.unpacker = multiprocessing.Process(target=self.unpack_cue)
+        self.unpacker.start()
+
+    def join(self):
+        if self.unpacker:
+            self.unpacker.join()
 
 
 def begin_recording(stream_data, stream_url):
     """
     Returns first whether to continue recording, and secondly if the recording is incomplete.
     """
-    global INDEX, PREVIOUS_SNIP
-    PREVIOUS_SNIP = None
-    INDEX = 0
+    song_index = 1
     dj = ""
     dj_ext = ""
-    roll_over = False
+
     try:
         if CHECK_FOR_DJ:
             dj_found = False
@@ -284,7 +408,6 @@ def begin_recording(stream_data, stream_url):
                 new_dj = get_dj()
                 if new_dj != dj:
                     if new_dj in EXCLUDE_DJ:
-                        roll_over = True
                         safe_stdout("\rExcluded DJ detected, skipping %s" % new_dj)
                         time.sleep(DJ_CHECK_INTERVAL)
                         continue
@@ -292,78 +415,69 @@ def begin_recording(stream_data, stream_url):
                     dj_found = True
     except KeyboardInterrupt:
         safe_stdout("\nQuitting program..")
+        return False, None
 
     folder_name = album = str(int(time.time()))
     if dj:
         folder_name += " %s" % dj
     location = os.path.join(FILE_PATH, folder_name)
     os.mkdir(location)
+    cue_path = os.path.join(location, "cue_file.txt")
+    cue_file = open(cue_path, 'w+')
 
     if CHECK_FOR_DJ:
         dj_ext = swap_djs(location, dj)
         safe_stdout(WHITE_SPACE)
-        to_write = "DJ %s has taken over the stream. %s\n" % (dj, dj_ext)
+        to_write = [True, dj, dj_ext]
         safe_stdout("\rDJ %s has taken over the stream." % dj)
         safe_stdout("\n")
-        cue_file = EasyWrite(os.path.join(location, "cue_file.txt"))
-        cue_file.write(to_write)
+        pickle.dump(to_write, cue_file)
+    else:
+        to_write = [False]
+        pickle.dump(to_write, cue_file)
 
-    request = requests.get(stream_url, stream=True)
     writer_lock = threading.RLock()
     writer_lock.acquire()
-    panic_lock = threading.RLock()
-    writer = threading.Thread(target=record_stream, args=(location, request, writer_lock, panic_lock))
-    writer.daemon = True
-    writer.start()
+    writer = StreamRecorder(location)
+    request = requests.get(stream_url, stream=True)
+    panic_lock, writer_thread = writer.record_stream(request, writer_lock)
     current_title = stream_data.title
     song_start = time.time()
     recording_start = song_start
-    start = True
     bitrate = stream_data.bitrate
-    audio_extension = SERVER_TYPES.get(stream_data.server_type, stream_data.server_type)
-    song_processing = None
-    safe_stdout("%.3d. %s" % (INDEX, stream_data.title))
+    audio_extension = SERVER_TYPES.get(stream_data.server_type,
+                                       stream_data.server_type)
+    safe_stdout("%.3d. %s %s" % (song_index, stream_data.title,
+                                 format_with_hours(time.time() - recording_start)))
     safe_stdout("\n")
 
     try:
         while not panic_lock.acquire(blocking=0):
             stream_data.update()
             if stream_data.title != current_title:
-                if start:
-                    start = False
-                to_write = "%s %s\n" % (current_title, format_seconds(time.time() - song_start))
-                cue_file.write(to_write)
+                current_song = SongData(
+                    song_index, location, current_title, audio_extension, dj,
+                    dj_ext, bitrate,  float(time.time() - song_start), album)
+                to_write = [current_song, True]
+                pickle.dump(to_write, cue_file)
                 safe_stdout(WHITE_SPACE)
-                INDEX += 1
-                if not CUE_ONLY:
-                    current_song = SongData(INDEX - 1, location, current_title, audio_extension, dj, dj_ext, bitrate,
-                                            float(time.time() - song_start), album)
-                    song_processing = threading.Thread(target=process_raw_song, args=(current_song,))
-                    song_processing.start()
-                if roll_over:
-                    roll_over = False
-                safe_stdout("\r%.3d. %s" % (INDEX, stream_data.title))
+                song_index += 1
+                safe_stdout("\r%.3d. %s %s" % (song_index, stream_data.title,
+                                               format_with_hours(time.time() - recording_start)))
                 safe_stdout('\n')
                 song_start = time.time()
                 current_title = stream_data.title
                 bitrate = stream_data.bitrate
-                audio_extension = SERVER_TYPES.get(stream_data.server_type, stream_data.server_type)
+                audio_extension = SERVER_TYPES.get(
+                    stream_data.server_type, stream_data.server_type)
                 if CHECK_FOR_DJ:
                     new_dj = get_dj()
                     if new_dj != dj:
-                        if RESTART_ON_DJ_CHANGE:
-                            raise NewDjException
                         if new_dj in EXCLUDE_DJ:
                             safe_stdout("\nExcluded DJ detected, skipping %s" % dj)
                             safe_stdout("\n")
                             raise ExcludedDjException
-                        dj = new_dj
-                        dj_ext = swap_djs(location, dj)
-                        safe_stdout(WHITE_SPACE)
-                        to_write = "DJ %s has taken over the stream. %s\n" % (dj, dj_ext)
-                        safe_stdout("\rDJ %s has taken over the stream." % dj)
-                        safe_stdout("\n")
-                        cue_file.write(to_write)
+                        raise NewDjException
             safe_stdout("\r%s: %s %skbps | DJ: %s | Listeners: %.04d | %s / %s" % (
                 stream_data.server_name, audio_extension.upper(), bitrate, dj,
                 stream_data.listeners, format_seconds(time.time() - song_start),
@@ -371,19 +485,14 @@ def begin_recording(stream_data, stream_url):
             time.sleep(SONG_CHECK_INTERVAL)
     except KeyboardInterrupt:
         safe_stdout("\nCleaning up and exiting program..")
-        to_write = "INCOMPLETE %s %s\n" % (current_title, format_seconds(time.time() - song_start))
-        cue_file.write(to_write)
+        current_song = SongData(
+            song_index, location, current_title, audio_extension, dj, dj_ext,
+            bitrate, float(time.time() - song_start), album)
+        to_write = [current_song, False]
+        pickle.dump(to_write, cue_file)
         writer_lock.release()
-        writer.join()
-        if not CUE_ONLY:
-            if song_processing and song_processing.is_alive():
-                song_processing.join()
-            current_song = SongData(INDEX, location, current_title, audio_extension, dj, dj_ext, bitrate,
-                                    float(time.time() - song_start), album)
-            song_processing = threading.Thread(target=process_raw_song, args=(current_song,))
-            song_processing.start()
-            song_processing.join()
-        return False
+        writer_thread.join()
+        return False, cue_path
     except NewDjException:
         safe_stdout("\nSetting up for next DJ..\n")
     except ExcludedDjException:
@@ -391,29 +500,20 @@ def begin_recording(stream_data, stream_url):
     except RequestException:
         safe_stdout("\nError in the query, restarting recording..\n")
     writer_lock.release()
-    writer.join()
-    if song_processing and song_processing.is_alive():
-        song_processing.join()
-    if not CUE_ONLY:
-        current_song = SongData(INDEX, location, current_title, audio_extension, dj, dj_ext, bitrate,
-                                float(time.time() - song_start), album)
-        song_processing = threading.Thread(target=process_raw_song, args=(current_song,))
-        song_processing.start()
-        song_processing.join()
-    if not CUE_ONLY:
-        if song_processing and song_processing.is_alive():
-            song_processing.join()
-    return True
+    writer_thread.join()
+    return True, cue_path
 
 
 def safe_query(query):
     start = time.time()
+    printed = False
     while True:
         try:
             return PyQuery(query)
-        except:  # ConnectionError or HTTPError as e:
-            if 0 < TIMEOUT < time.time() - start:
+        except:
+            if not printed:#0 < TIMEOUT < time.time() - start:
                 print ("\nPyQuery timed out")  # with the following message: %s" % e.message)
+                printed = True
                 #raise e
             time.sleep(1.0)
 
@@ -580,8 +680,14 @@ def optional_config(config):
 
 def recording_loop(stream_url, stream_data):
     do_continue = True
+    proc = None
     while do_continue:
-        do_continue = begin_recording(stream_data, stream_url)
+        do_continue, cue_file = begin_recording(stream_data, stream_url)
+        if cue_file:
+            proc = SongProcessor(cue_file)
+            proc.mp_unpack()
+    if proc:
+        proc.join()
 
 
 def get_avg_delay(stream_xsl):
