@@ -1,4 +1,6 @@
-Python Stream Saver
+# Python Stream Saver
+
+**Deprecated in favor of Nora**
 
 This is a simple internet radio downloader, currently not stable enough so there's probably better alternatives. This is mainly just to keep track of progress and whatnot.
 
